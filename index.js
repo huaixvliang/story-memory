@@ -71,6 +71,8 @@ const DEFAULTS = {
     globalEvents: [],    // 全局大事件轴 [{time, location, characters, event, tags}]
     globalSummary: '',   // 全局总纲
     mainlineSummary: '', // 主线大记忆
+    _lastCollected: -1,  // 已收进队列的最高 chat 索引（持久化，防刷新/切卡后重复总结旧消息）
+    _failCount: 0,       // 连续总结失败计数（失败重试上限，防死循环）
 };
 
 // ---------- 存储（角色卡记忆隔离） ----------
@@ -365,7 +367,17 @@ function autoDiscoverNames() {
     return names;
 }
 
-/** 角色注册表 = 自动识别 ∪ 手动钉住 ∪ 记忆里已有的人物 */
+/** 用户（玩家）本人可能的称呼：name1 + 通用「玩家」标签 */
+function getUserNames() {
+    const ctx = getContext();
+    const set = new Set();
+    const u = String(ctx.name1 || '').trim();
+    if (u && !SKIP_NAMES.has(u.toLowerCase())) set.add(u);
+    set.add('玩家');
+    return [...set];
+}
+
+/** 角色注册表 = 自动识别 ∪ 手动钉住 ∪ 记忆里已有的人物 ∪ 玩家本人 */
 function getCharacterRegistry() {
     const set = new Set();
     for (const n of autoDiscoverNames()) set.add(n);
@@ -373,6 +385,7 @@ function getCharacterRegistry() {
     for (const n of (mem.charNames || [])) if (n && String(n).trim()) set.add(String(n).trim());
     for (const n of Object.keys(mem.snapshot || {})) set.add(n);
     for (const n of Object.keys(mem.characters || {})) set.add(n);
+    for (const n of getUserNames()) set.add(n); // 玩家本人也要抓数值
     return [...set].filter(Boolean);
 }
 
@@ -450,6 +463,8 @@ function parseFieldPairs(seg) {
     apply(/([\u4e00-\u9fa5A-Za-z]{2,8})\s+(-?\d+(?:\.\d+)?)/g);
     // C：紧贴数字    好感80（纯中文字段 ≥2 字）
     apply(/([\u4e00-\u9fa5]{2,6})(-?\d+(?:\.\d+)?)/g);
+    // D：紧贴数字    HP500 / ATK120（纯英文字段 ≥2 字）
+    apply(/([A-Za-z]{2,8})(-?\d+(?:\.\d+)?)/g);
 
     return out;
 }
@@ -573,6 +588,8 @@ function buildExtractPrompt(historyText, snapshotText, names, fields) {
         '',
         `【已知人物名单（优先从里面识别，出现新人名也照实记录）】\n${nameLine}`,
         '',
+        '注意：「玩家」是用户本人，其状态面板（修为/等级/HP/属性/资源 等）同样要提取到 values 里，不要漏掉。',
+        '',
         `【需要追踪的数值字段（只提取对话中明确出现的；列表为空则自动提取所有数值状态）】\n${fieldLine}`,
         '',
         `【当前已有数值快照（增量更新：本次没提到的人物/数值保持原值，不要编造）】\n${snapshotText || '（暂无）'}`,
@@ -658,6 +675,7 @@ function pushMessage(messageId) {
     const role = msg.is_user ? '玩家' : '角色';
     mem.pending.push({ role, text: String(msg.mes), chatIndex: messageId });
     capPending(mem);
+    if (messageId > (mem._lastCollected ?? -1)) mem._lastCollected = messageId;
 
     // AI 消息：从正文状态栏正则抓精确数值（每轮即时更新快照，双源校验的精确源）
     if (!msg.is_user) {
@@ -677,6 +695,10 @@ function collectPendingFromChat() {
     for (const id of processedIds) {
         if (id >= chat.length) processedIds.delete(id);
     }
+    // 删消息导致 chat 变短时，同步把水位往回缩，避免下次扫描错位
+    if ((mem._lastCollected ?? -1) >= chat.length) {
+        mem._lastCollected = chat.length - 1;
+    }
 
     // 已入队但内容变了（swipe 刷消息）→ 以最新内容为准，覆盖旧版本
     for (const p of mem.pending) {
@@ -685,8 +707,10 @@ function collectPendingFromChat() {
         }
     }
 
+    // 从「已收集水位 + 1」开始扫，避免刷新/切卡后把整段旧聊天重新总结一遍
     let collected = 0;
-    for (let i = 0; i < chat.length; i++) {
+    const startIdx = Math.max(0, (mem._lastCollected ?? -1) + 1);
+    for (let i = startIdx; i < chat.length; i++) {
         const msg = chat[i];
         if (!msg || !msg.mes) continue;
         if (processedIds.has(i)) continue;
@@ -700,6 +724,7 @@ function collectPendingFromChat() {
             try { applyStatusBar(String(msg.mes)); } catch (e) { /* 忽略 */ }
         }
     }
+    if (chat.length) mem._lastCollected = chat.length - 1;
 
     // swipe 后，最后一条 AI 消息变了 → 重新抓最新数值（覆盖中间版本的脏数据）
     const lastMsg = chat[chat.length - 1];
@@ -747,8 +772,25 @@ async function scheduleSummarize(scopeKey) {
             else if (m.role === '角色' && a < mem.queueSize) { batch.push(m); a++; }
             else rest.push(m);
         }
-        mem.pending = rest;
-        if (batch.length) await summarizeBatch(batch, scopeKey);
+        if (!batch.length) { mem.pending = rest; return; }
+
+        const ok = await summarizeBatch(batch, scopeKey);
+        if (ok) {
+            mem.pending = rest;
+            mem._failCount = 0;
+        } else {
+            // 失败：把本批放回队首重试，但连续失败 3 次就丢弃本批，避免死循环 + 无限烧 token
+            mem._failCount = (mem._failCount || 0) + 1;
+            if (mem._failCount >= 3) {
+                mem.pending = rest;
+                mem._failCount = 0;
+                console.warn(LOG, '连续 3 次总结失败，已丢弃本批消息以免死循环。');
+            } else {
+                mem.pending = batch.concat(rest);
+                console.warn(LOG, `总结失败，将重试（第 ${mem._failCount}/2 次）。`);
+            }
+        }
+        persist();
     } finally {
         summarizing = false;
         checkSummarize();
@@ -774,8 +816,8 @@ async function manualSummarize(n) {
         if (userCount >= n && aiCount >= n) break;
     }
     if (!msgs.length) return 0;
-    await summarizeBatch(msgs, scopeKey);
-    return msgs.length;
+    const ok = await summarizeBatch(msgs, scopeKey);
+    return ok ? msgs.length : 0;
 }
 
 async function summarizeBatch(batch, scopeKey) {
@@ -788,12 +830,12 @@ async function summarizeBatch(batch, scopeKey) {
         '你是剧情记忆归档器，只输出 JSON，不要任何解释。',
         600,
     );
-    if (!result) return;
+    if (!result) return false;
 
     const event = extractJson(result);
     if (!event) {
         console.warn(LOG, '无法解析总结 JSON，跳过本次，原始输出：\n', String(result).slice(0, 300));
-        return;
+        return false;
     }
 
     // 1) 数值快照覆盖更新（通用：接受任意数值字段 + 可选 note 文本）
@@ -828,9 +870,12 @@ async function summarizeBatch(batch, scopeKey) {
     };
 
     // 3) 归档到「主互动对象」名下（多人 = 共有记忆，每人各存一份）
-    const mains = Array.isArray(event.mainCharacters) && event.mainCharacters.length
+    //    玩家本人只存数值（snapshot），不建「玩家的记忆」事件档，避免注入冗余
+    const userSet = new Set(getUserNames());
+    const rawMains = Array.isArray(event.mainCharacters) && event.mainCharacters.length
         ? event.mainCharacters
         : ev.characters;
+    const mains = rawMains.filter(name => name && !userSet.has(name));
     const archived = new Set();
     for (const name of mains) {
         if (!name || archived.has(name)) continue;
@@ -857,6 +902,7 @@ async function summarizeBatch(batch, scopeKey) {
 
     persist();
     refreshPanel();
+    return true;
 }
 
 /** 把主线推进片段追加进主线大记忆（超长再压缩成连贯主线） */
@@ -1189,6 +1235,8 @@ function clearScopeMem(scopeKey) {
     mem.globalEvents = [];
     mem.globalSummary = '';
     mem.mainlineSummary = '';
+    mem._lastCollected = -1;
+    mem._failCount = 0;
     const ps = scopeProcessed.get(scopeKey);
     if (ps) ps.clear();
     persist();
@@ -1205,6 +1253,8 @@ function clearAllScopes() {
         m.globalEvents = [];
         m.globalSummary = '';
         m.mainlineSummary = '';
+        m._lastCollected = -1;
+        m._failCount = 0;
     }
     scopeProcessed.clear();
     currentScopeKey = '';
