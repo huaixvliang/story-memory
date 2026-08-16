@@ -73,43 +73,138 @@ const DEFAULTS = {
     mainlineSummary: '', // 主线大记忆
 };
 
-// ---------- 存储 ----------
+// ---------- 存储（角色卡记忆隔离） ----------
 
-function getMem() {
+const STORE_VERSION = 2;
+
+// 当前作用域 & 各作用域的「已处理消息去重表」（session 内，不持久化；切卡自动切换）
+let currentScopeKey = '';
+let processedIds = new Set();
+const scopeProcessed = new Map(); // scopeKey -> Set(chatIndex)
+
+/** 当前作用域键：单卡用 char:头像，群聊用 group:群id（头像/群id 比索引稳定，跨刷新不变） */
+function getScopeKey() {
+    const ctx = getContext();
+    if (ctx.groupId) return 'group:' + String(ctx.groupId);
+    const ch = (ctx.characterId !== undefined && ctx.characters) ? ctx.characters[ctx.characterId] : null;
+    if (ch && ch.avatar) return 'char:' + String(ch.avatar);
+    if (ctx.name2) return 'char:' + String(ctx.name2);
+    return 'default';
+}
+
+/** 切换到当前作用域对应的去重表 */
+function syncScope() {
+    const key = getScopeKey();
+    if (key === currentScopeKey) return;
+    currentScopeKey = key;
+    let s = scopeProcessed.get(key);
+    if (!s) { s = new Set(); scopeProcessed.set(key, s); }
+    processedIds = s;
+}
+
+/** 作用域键 → 友好显示名（角色名 / 群名） */
+function friendlyScopeLabel(key) {
+    if (!key) return '默认';
+    const ctx = getContext();
+    if (key.startsWith('group:')) {
+        const id = key.slice(6);
+        const g = (ctx.groups || []).find(x => String(x.id) === id);
+        return g?.name ? `群聊：${g.name}` : key;
+    }
+    if (key.startsWith('char:')) {
+        const id = key.slice(5);
+        const arr = ctx.characters || [];
+        const c = arr.find(x => x && x.avatar === id);
+        return c?.name ? `角色：${c.name}` : key;
+    }
+    return key;
+}
+
+/** 取作用域的显示名（优先用创建时记住的 label，兜底实时计算） */
+function scopeLabel(key) {
+    const store = getStore();
+    return (store.labels && store.labels[key]) || friendlyScopeLabel(key);
+}
+
+/** 顶层存储对象（wrapper）：{ _v, currentScope, scopes:{scopeKey:记忆数据}, labels } */
+function getStore() {
     if (!extension_settings[MODULE]) {
-        extension_settings[MODULE] = JSON.parse(JSON.stringify(DEFAULTS));
+        extension_settings[MODULE] = { _v: STORE_VERSION, currentScope: '', scopes: {} };
         migrateLegacy();
+    }
+    const s = extension_settings[MODULE];
+    if (!s.scopes || typeof s.scopes !== 'object') {
+        wrapFlatStore(s);
+    }
+    return s;
+}
+
+/** 把旧版「扁平单份记忆」打包成 _legacy，等首个作用域创建时并入 */
+function wrapFlatStore(s) {
+    const flat = {};
+    for (const k of Object.keys(DEFAULTS)) if (k in s) flat[k] = s[k];
+    for (const k of Object.keys(s)) delete s[k];
+    s._v = STORE_VERSION;
+    s.currentScope = '';
+    s.scopes = {};
+    if (Object.keys(flat).length) s._legacy = flat;
+}
+
+/** 确保某作用域存在并补齐缺省字段，返回该作用域的「记忆数据」对象 */
+function ensureScope(key) {
+    const store = getStore();
+    let scope = store.scopes[key];
+    if (!scope) {
+        scope = JSON.parse(JSON.stringify(DEFAULTS));
+        store.scopes[key] = scope;
+        store.labels = store.labels || {};
+        if (!store.labels[key]) store.labels[key] = friendlyScopeLabel(key);
+        // 有旧数据待迁移 → 并入首个被创建的作用域（即当前正打开的角色卡）
+        if (store._legacy && typeof store._legacy === 'object') {
+            for (const [k, v] of Object.entries(store._legacy)) {
+                if (k in DEFAULTS) scope[k] = v;
+            }
+            delete store._legacy;
+        }
     } else {
-        const s = extension_settings[MODULE];
         for (const [k, v] of Object.entries(DEFAULTS)) {
-            if (!(k in s)) s[k] = JSON.parse(JSON.stringify(v));
+            if (!(k in scope)) scope[k] = JSON.parse(JSON.stringify(v));
         }
     }
-    return extension_settings[MODULE];
+    return scope;
+}
+
+/** 取「当前卡片/群聊」的记忆数据（自动随切卡切换） */
+function getMem() {
+    syncScope();
+    const store = getStore();
+    store.currentScope = currentScopeKey;
+    return ensureScope(currentScopeKey);
+}
+
+/** 取指定作用域的记忆数据（总结中途锁定作用域，避免切卡时写错地方） */
+function getMemForScope(key) {
+    return ensureScope(key);
 }
 
 /** 从旧版「ntr-memory」无缝迁移记忆数据（仅首次运行、且存在旧数据时触发） */
 function migrateLegacy() {
     const old = extension_settings['ntr-memory'];
     if (!old) return;
-    const mem = extension_settings[MODULE];
+    const store = extension_settings[MODULE];
     try {
-        if (old.snapshot && typeof old.snapshot === 'object') mem.snapshot = old.snapshot;
-        if (old.characters && typeof old.characters === 'object') mem.characters = old.characters;
-        if (Array.isArray(old.globalEvents)) mem.globalEvents = old.globalEvents;
-        if (typeof old.globalSummary === 'string') mem.globalSummary = old.globalSummary;
-        if (typeof old.mainlineSummary === 'string') mem.mainlineSummary = old.mainlineSummary;
-        if (typeof old.worldview === 'string') mem.worldview = old.worldview;
-        if (typeof old.queueSize === 'number') mem.queueSize = old.queueSize;
-        if (typeof old.eventsPerChar === 'number') mem.eventsPerChar = old.eventsPerChar;
-        if (typeof old.globalMax === 'number') mem.globalMax = old.globalMax;
+        const flat = {};
+        for (const k of Object.keys(DEFAULTS)) {
+            if (k === 'pending') continue; // 旧待总结队列不迁移，从头开始
+            if (k in old) flat[k] = old[k];
+        }
         // 旧版 NTR 专属字段/名单，迁移为「偏好字段」和「钉住名单」，升级后依旧无缝
-        mem.valueFields = ['好感', '沉沦', '背德', '暴露', '服从', '发现'];
-        mem.charNames = [
+        flat.valueFields = ['好感', '沉沦', '背德', '暴露', '服从', '发现'];
+        flat.charNames = [
             '沈清璃', '沈若薇', '沈知夏', '沈知禾', '楚岚', '周若曦', '周小满', '沈知桃',
             '陆国梁', '赵明远', '顾北辰', '顾怀瑾', '周震', '方景行', '程一川', '周野',
         ];
-        mem.relations = {
+        flat.relations = {
             '沈清璃': { target: '陆国梁', label: '丈夫' },
             '沈若薇': { target: '赵明远', label: '未婚夫' },
             '沈知夏': { target: '顾北辰', label: '男友' },
@@ -119,6 +214,8 @@ function migrateLegacy() {
             '周小满': { target: '程一川', label: '青梅竹马' },
             '沈知桃': { target: '周野', label: '男友' },
         };
+        if (Object.keys(flat).length) store._legacy = flat;
+        delete extension_settings['ntr-memory'];
         persist();
         console.log(LOG, '已从旧版 ntr-memory 迁移记忆数据。');
     } catch (e) {
@@ -240,7 +337,7 @@ function autoDiscoverNames() {
     const ctx = getContext();
     const chat = ctx.chat || [];
     const groups = ctx.groups || [];
-    const cacheKey = `${chat.length}:${ctx.name2 || ''}:${groups.length}`;
+    const cacheKey = `${currentScopeKey}:${chat.length}:${ctx.name2 || ''}:${groups.length}`;
     if (_namesCache.key === cacheKey) return _namesCache.names;
 
     const set = new Set();
@@ -425,8 +522,7 @@ function refreshSnapshotFromChat() {
 
 // ---------- 世界书常驻条目拉取 ----------
 
-let cachedWorldView = '';
-let cachedWorldViewTime = 0;
+let cachedWorldView = { key: '', time: 0, text: '' };
 
 /** 当前启用的世界书名（优先取「已选中/激活」的，其次退化为全部） */
 function getActiveWorldNames() {
@@ -436,12 +532,13 @@ function getActiveWorldNames() {
     return all;
 }
 
-/** 拉取当前已启用世界书的「常驻条目」内容（带 30 秒缓存，避免每次生成都读盘） */
+/** 拉取当前已启用世界书的「常驻条目」内容（带 30 秒缓存 + 按作用域区分，避免切卡串书） */
 async function getConstantWorldInfo() {
+    const names = getActiveWorldNames();
+    const key = `${currentScopeKey}|${names.join(',')}`;
     const now = Date.now();
-    if (now - cachedWorldViewTime < 30000) return cachedWorldView;
+    if (cachedWorldView.key === key && now - cachedWorldView.time < 30000) return cachedWorldView.text;
     try {
-        const names = getActiveWorldNames();
         const parts = [];
         for (const name of names) {
             const book = await loadWorldInfo(name);
@@ -453,12 +550,12 @@ async function getConstantWorldInfo() {
                 }
             }
         }
-        cachedWorldView = parts.join('\n');
-        cachedWorldViewTime = now;
-        return cachedWorldView;
+        const text = parts.join('\n');
+        cachedWorldView = { key, time: now, text };
+        return text;
     } catch (e) {
         console.warn(LOG, '拉取世界书常驻条目失败：', e);
-        return cachedWorldView;
+        return cachedWorldView.key === key ? cachedWorldView.text : '';
     }
 }
 
@@ -541,7 +638,6 @@ async function callMainApi(prompt, systemPrompt, responseLength) {
 // ---------- 总结流程 ----------
 
 let summarizing = false;
-let processedIds = new Set();
 
 function capPending(mem) {
     if (mem.pending.length > MAX_PENDING) {
@@ -622,18 +718,19 @@ function collectPendingFromChat() {
  * 至少需要 1 条角色消息才开始总结（保证有可提取的正文数值）。
  */
 function checkSummarize() {
-    const mem = getMem();
+    const scopeKey = currentScopeKey; // 锁定当前卡，避免 600ms 延迟期间切卡导致总结错位
+    const mem = getMemForScope(scopeKey);
     if (summarizing) return;
     const total = mem.pending.length;
     const aiCount = mem.pending.filter(m => m.role === '角色').length;
     if (total >= mem.queueSize * 2 && aiCount >= 1) {
         console.log(LOG, `已攒满 ${total} 条消息，触发自动总结`);
-        setTimeout(() => { scheduleSummarize().catch(() => {}); }, 600);
+        setTimeout(() => { scheduleSummarize(scopeKey).catch(() => {}); }, 600);
     }
 }
 
-async function scheduleSummarize() {
-    const mem = getMem();
+async function scheduleSummarize(scopeKey) {
+    const mem = getMemForScope(scopeKey || currentScopeKey);
     if (summarizing) return;
     const total = mem.pending.length;
     const aiCount = mem.pending.filter(m => m.role === '角色').length;
@@ -651,7 +748,7 @@ async function scheduleSummarize() {
             else rest.push(m);
         }
         mem.pending = rest;
-        if (batch.length) await summarizeBatch(batch);
+        if (batch.length) await summarizeBatch(batch, scopeKey);
     } finally {
         summarizing = false;
         checkSummarize();
@@ -660,6 +757,7 @@ async function scheduleSummarize() {
 
 /** 手动总结最近 n 条消息（n 条玩家 + n 条角色），返回实际总结的条数 */
 async function manualSummarize(n) {
+    const scopeKey = currentScopeKey;
     const context = getContext();
     const chat = context.chat || [];
     const msgs = [];
@@ -676,12 +774,12 @@ async function manualSummarize(n) {
         if (userCount >= n && aiCount >= n) break;
     }
     if (!msgs.length) return 0;
-    await summarizeBatch(msgs);
+    await summarizeBatch(msgs, scopeKey);
     return msgs.length;
 }
 
-async function summarizeBatch(batch) {
-    const mem = getMem();
+async function summarizeBatch(batch, scopeKey) {
+    const mem = getMemForScope(scopeKey || currentScopeKey);
     const historyText = batch.map((m, i) => `${i + 1}. [${m.role}] ${m.text}`).join('\n');
     const snapshotText = snapshotToText(mem);
 
@@ -741,7 +839,7 @@ async function summarizeBatch(batch) {
         mem.characters[name].events.push({ ...ev });
         if (mem.characters[name].events.length > mem.eventsPerChar) {
             const overflow = mem.characters[name].events.splice(0, mem.characters[name].events.length - mem.eventsPerChar);
-            await rollCharSummary(name, overflow);
+            await rollCharSummary(mem, name, overflow);
         }
     }
 
@@ -749,12 +847,12 @@ async function summarizeBatch(batch) {
     mem.globalEvents.push({ ...ev });
     if (mem.globalEvents.length > mem.globalMax) {
         const overflow = mem.globalEvents.splice(0, mem.globalEvents.length - mem.globalMax);
-        await rollGlobalSummary(overflow);
+        await rollGlobalSummary(mem, overflow);
     }
 
     // 5) 主线大记忆：本段对主线的宏观推进 → 滚动压缩成连贯主线
     if (typeof event.mainline === 'string' && event.mainline.trim()) {
-        await rollMainline(event.mainline.trim());
+        await rollMainline(mem, event.mainline.trim());
     }
 
     persist();
@@ -762,8 +860,7 @@ async function summarizeBatch(batch) {
 }
 
 /** 把主线推进片段追加进主线大记忆（超长再压缩成连贯主线） */
-async function rollMainline(piece) {
-    const mem = getMem();
+async function rollMainline(mem, piece) {
     mem.mainlineSummary = mem.mainlineSummary ? `${mem.mainlineSummary}\n${piece}` : piece;
     if (mem.mainlineSummary.length > mem.summaryMaxLen) {
         const old = mem.mainlineSummary;
@@ -779,8 +876,7 @@ async function rollMainline(piece) {
 }
 
 /** 把某角色滚出的事件压成一段摘要，追加到该角色 summary（超长再压缩） */
-async function rollCharSummary(name, events) {
-    const mem = getMem();
+async function rollCharSummary(mem, name, events) {
     const text = events.map(eventToLine).join('\n');
     let piece = '';
     try {
@@ -810,8 +906,7 @@ async function rollCharSummary(name, events) {
 }
 
 /** 把滚出的全局大事件压进全局总纲 */
-async function rollGlobalSummary(events) {
-    const mem = getMem();
+async function rollGlobalSummary(mem, events) {
     const text = events.map(eventToLine).join('\n');
     let piece = '';
     try {
@@ -961,6 +1056,7 @@ function registerCommands() {
             const aiCount = mem.pending.filter(m => m.role === '角色').length;
             const lines = [
                 '【记忆核心状态】',
+                `记忆范围：${scopeLabel(currentScopeKey)}`,
                 `状态：${mem.enabled ? '运行中' : '已暂停'}`,
                 `待总结：玩家 ${userCount} 条 / 角色 ${aiCount} 条（攒满约 ${mem.queueSize} 轮触发）`,
                 `数值快照人物：${Object.keys(mem.snapshot).length} 人`,
@@ -1038,30 +1134,82 @@ function registerCommands() {
     registerSlashCommand(
         'mem-clear',
         () => {
-            const mem = getMem();
-            mem.pending = [];
-            mem.snapshot = {};
-            mem.characters = {};
-            mem.globalEvents = [];
-            mem.globalSummary = '';
-            mem.mainlineSummary = '';
-            processedIds.clear();
-            persist();
-            return '[记忆核心] 已清空全部记忆。';
+            clearScopeMem(currentScopeKey);
+            return `[记忆核心] 已清空「${scopeLabel(currentScopeKey)}」的全部记忆。`;
         },
         [],
-        '清空记忆核心的全部记忆',
+        '清空当前角色卡/群聊的全部记忆',
+    );
+
+    registerSlashCommand(
+        'mem-clear-all',
+        () => {
+            clearAllScopes();
+            return '[记忆核心] 已清空所有角色卡/群聊的全部记忆。';
+        },
+        [],
+        '清空所有角色卡/群聊的记忆',
+    );
+
+    registerSlashCommand(
+        'mem-scopes',
+        () => {
+            const store = getStore();
+            const keys = Object.keys(store.scopes || {});
+            if (!keys.length) return '[记忆核心] 还没有任何角色卡的记忆。';
+            const lines = ['【已保存记忆的角色卡/群聊】'];
+            for (const key of keys) {
+                const m = store.scopes[key];
+                const mark = key === currentScopeKey ? '▶ ' : '  ';
+                lines.push(`${mark}${scopeLabel(key)}：人物 ${Object.keys(m.snapshot || {}).length}/${Object.keys(m.characters || {}).length}，事件 ${(m.globalEvents || []).length}`);
+            }
+            return lines.join('\n');
+        },
+        [],
+        '列出所有角色卡/群聊的记忆',
     );
 
     registerSlashCommand(
         'mem-export',
         () => {
-            const json = exportMemory();
-            return `[记忆核心] 导出数据（复制下面这段到「导入记忆」粘贴即可）：\n\`\`\`json\n${json}\n\`\`\``;
+            const json = exportScope(currentScopeKey);
+            return `[记忆核心] 导出「${scopeLabel(currentScopeKey)}」的数据（复制下面这段到「导入记忆」粘贴即可）：\n\`\`\`json\n${json}\n\`\`\``;
         },
         [],
-        '导出全部记忆为 JSON（复制后可用面板「导入记忆」恢复）',
+        '导出当前角色卡的记忆为 JSON（复制后可用面板「导入记忆」恢复）',
     );
+}
+
+/** 清空某作用域的记忆数据（保留配置字段），并清空该作用域的已处理去重表 */
+function clearScopeMem(scopeKey) {
+    const mem = getMemForScope(scopeKey);
+    mem.pending = [];
+    mem.snapshot = {};
+    mem.characters = {};
+    mem.globalEvents = [];
+    mem.globalSummary = '';
+    mem.mainlineSummary = '';
+    const ps = scopeProcessed.get(scopeKey);
+    if (ps) ps.clear();
+    persist();
+}
+
+/** 清空所有作用域的记忆数据 */
+function clearAllScopes() {
+    const store = getStore();
+    for (const key of Object.keys(store.scopes || {})) {
+        const m = store.scopes[key];
+        m.pending = [];
+        m.snapshot = {};
+        m.characters = {};
+        m.globalEvents = [];
+        m.globalSummary = '';
+        m.mainlineSummary = '';
+    }
+    scopeProcessed.clear();
+    currentScopeKey = '';
+    processedIds = new Set();
+    persist();
 }
 
 // ---------- 设置面板（可视化改记忆 / 调参数） ----------
@@ -1070,7 +1218,11 @@ function buildSettingsHtml() {
     return `
     <div id="story-memory-settings" class="smem-panel">
         <h3>剧情记忆核心 · Story MemoryCore</h3>
-        <div class="smem-row"><label><input type="checkbox" id="smem-enabled"> 启用记忆注入</label></div>
+        <div class="smem-row"><label><input type="checkbox" id="smem-enabled"> 启用记忆注入（当前卡）</label></div>
+        <div class="smem-label">记忆隔离：每个角色卡 / 群聊各自独立一份记忆，切换时自动切换。</div>
+        <div id="smem-scope-indicator" style="color:#f0f0fa;margin-bottom:4px"></div>
+        <div id="smem-scopes"></div>
+        <hr>
 
         <div class="smem-manual-box">
             <div class="smem-label">手动总结（测试用，立即出结果）：</div>
@@ -1115,9 +1267,11 @@ function buildSettingsHtml() {
         <textarea id="smem-globalsummary" rows="2" style="width:100%"></textarea>
         <hr>
         <div class="smem-row">
-            <button id="smem-export">导出记忆</button>
+            <button id="smem-export">导出本卡</button>
+            <button id="smem-export-all">导出全部卡</button>
             <button id="smem-import">导入记忆</button>
-            <button id="smem-clear" class="smem-danger">清空全部记忆</button>
+            <button id="smem-clear" class="smem-danger">清空本卡记忆</button>
+            <button id="smem-clear-all" class="smem-danger">清空所有卡记忆</button>
         </div>
     </div>`;
 }
@@ -1300,9 +1454,47 @@ function renderSettings() {
     document.getElementById('smem-relations').value = serializeRelations(mem.relations);
     document.getElementById('smem-mainline').value = mem.mainlineSummary;
     document.getElementById('smem-globalsummary').value = mem.globalSummary;
+    const indicator = document.getElementById('smem-scope-indicator');
+    if (indicator) indicator.textContent = `▶ 当前记忆范围：${scopeLabel(currentScopeKey)}`;
+    renderScopes();
     renderSnapshot(mem);
     renderCharacters(mem);
     renderGlobalEvents(mem);
+}
+
+/** 渲染「记忆隔离」作用域列表（各角色卡/群聊的记忆概览 + 删除） */
+function renderScopes() {
+    const container = document.getElementById('smem-scopes');
+    if (!container) return;
+    const store = getStore();
+    const keys = Object.keys(store.scopes || {});
+    if (!keys.length) {
+        container.innerHTML = '<div class="smem-muted">（暂无记忆，对话并自动总结后会自动按角色卡建档）</div>';
+        return;
+    }
+    let html = '';
+    for (const key of keys) {
+        const m = store.scopes[key];
+        const isCur = key === currentScopeKey;
+        const stats = `人物${Object.keys(m.snapshot || {}).length}/${Object.keys(m.characters || {}).length} · 事件${(m.globalEvents || []).length}`;
+        html += `<div class="smem-item" style="display:flex;align-items:center;gap:6px;justify-content:space-between;margin-bottom:2px">
+            <span>${isCur ? '▶ ' : ''}${escapeHtml(scopeLabel(key))} <span style="color:#777">（${stats}）</span></span>
+            <button class="smem-scope-del" data-key="${escapeHtml(key)}">删</button>
+        </div>`;
+    }
+    container.innerHTML = html;
+    container.querySelectorAll('.smem-scope-del').forEach(btn => {
+        btn.addEventListener('click', () => {
+            if (!confirm(`删除「${scopeLabel(btn.dataset.key)}」的全部记忆？此操作不可恢复。`)) return;
+            const key = btn.dataset.key;
+            delete store.scopes[key];
+            if (store.labels) delete store.labels[key];
+            const ps = scopeProcessed.get(key);
+            if (ps) { ps.clear(); scopeProcessed.delete(key); }
+            persist();
+            renderSettings();
+        });
+    });
 }
 
 function bindSettingsEvents() {
@@ -1387,32 +1579,37 @@ function bindSettingsEvents() {
         toastr?.success?.(`已抓取最后一条消息的数值（${n} 个字段）`);
     });
     document.getElementById('smem-clear').addEventListener('click', () => {
-        if (!confirm('确定清空全部记忆？')) return;
-        const mem = getMem();
-        mem.pending = [];
-        mem.snapshot = {};
-        mem.characters = {};
-        mem.globalEvents = [];
-        mem.globalSummary = '';
-        mem.mainlineSummary = '';
-        processedIds.clear();
-        persist();
+        if (!confirm(`确定清空「${scopeLabel(currentScopeKey)}」的全部记忆？`)) return;
+        clearScopeMem(currentScopeKey);
+        renderSettings();
+    });
+    document.getElementById('smem-clear-all').addEventListener('click', () => {
+        if (!confirm('确定清空【所有角色卡/群聊】的全部记忆？此操作不可恢复。')) return;
+        clearAllScopes();
         renderSettings();
     });
     document.getElementById('smem-export').addEventListener('click', () => {
-        const json = exportMemory();
+        const json = exportScope(currentScopeKey);
         try { navigator.clipboard?.writeText(json); toastr?.success?.('记忆已复制到剪贴板'); } catch (e) { /* 忽略 */ }
-        showTextDialog('导出记忆（已尝试复制，也可手动全选复制）：', json);
+        showTextDialog(`导出「${scopeLabel(currentScopeKey)}」（已尝试复制，也可手动全选复制）：`, json);
+    });
+    document.getElementById('smem-export-all').addEventListener('click', () => {
+        const json = exportAllScopes();
+        try { navigator.clipboard?.writeText(json); toastr?.success?.('全部卡记忆已复制到剪贴板'); } catch (e) { /* 忽略 */ }
+        showTextDialog('导出全部角色卡记忆（已尝试复制，也可手动全选复制）：', json);
     });
     document.getElementById('smem-import').addEventListener('click', showImportDialog);
 }
 
-function exportMemory() {
-    const mem = getMem();
+/** 导出单个作用域（当前角色卡）的记忆 */
+function exportScope(scopeKey) {
+    const mem = getMemForScope(scopeKey);
     const data = {
         _export: 'story-memory',
-        _version: 1,
+        _version: 2,
         _time: new Date().toISOString(),
+        scope: scopeKey,
+        scopeLabel: scopeLabel(scopeKey),
         snapshot: mem.snapshot,
         characters: mem.characters,
         globalEvents: mem.globalEvents,
@@ -1426,12 +1623,37 @@ function exportMemory() {
     return JSON.stringify(data, null, 2);
 }
 
+/** 导出所有作用域的记忆 */
+function exportAllScopes() {
+    const store = getStore();
+    return JSON.stringify({
+        _export: 'story-memory-all',
+        _version: 2,
+        _time: new Date().toISOString(),
+        scopes: store.scopes,
+        labels: store.labels,
+    }, null, 2);
+}
+
 function importMemory(jsonText) {
     let data;
     try { data = JSON.parse(jsonText); } catch { return false; }
-    // 兼容旧版 ntr-memory 导出（_export 不同），也兼容无标记的裸 JSON
-    const isOurs = data && (data._export === 'story-memory' || data._export === 'ntr-memory' || data.snapshot || data.characters);
-    if (!isOurs) return false;
+
+    // 全量导入（含所有角色卡）
+    if (data && data._export === 'story-memory-all' && data.scopes && typeof data.scopes === 'object') {
+        const store = getStore();
+        store.scopes = data.scopes;
+        store.labels = data.labels || {};
+        scopeProcessed.clear();
+        currentScopeKey = '';
+        processedIds = new Set();
+        persist();
+        return true;
+    }
+
+    // 单作用域导入（含旧版 ntr-memory / v1 story-memory 导出）
+    const isScope = data && (data._export === 'story-memory' || data._export === 'ntr-memory' || data.snapshot || data.characters);
+    if (!isScope) return false;
     const mem = getMem();
     if (data.snapshot && typeof data.snapshot === 'object') mem.snapshot = data.snapshot;
     if (data.characters && typeof data.characters === 'object') mem.characters = data.characters;
@@ -1523,6 +1745,10 @@ function init() {
             if (idx < 0) return;
             const isAI = pushMessage(idx);
             if (isAI) checkSummarize();
+        });
+        // 切换角色卡/群聊时，面板自动切到对应作用域的数据
+        eventSource.on(event_types.CHAT_CHANGED, () => {
+            try { renderSettings(); } catch (e) { /* 忽略 */ }
         });
     }
     try { registerCommands(); } catch (e) { console.warn(LOG, '命令注册失败：', e); }
