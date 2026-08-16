@@ -1,0 +1,149 @@
+/* 剧情记忆核心（Story MemoryCore）—— 面板美化（适配 SillyTavern 暗色主题） */
+#story-memory-settings.smem-panel {
+    padding: 14px 16px;
+    background: #191920;
+    border: 1px solid #2c2c38;
+    border-radius: 10px;
+    font-size: 13px;
+    color: #d5d5e0;
+    line-height: 1.5;
+}
+
+#story-memory-settings h3 {
+    margin: 0 0 10px;
+    font-size: 15px;
+    font-weight: 600;
+    color: #f0f0fa;
+    border-bottom: 1px solid #2c2c38;
+    padding-bottom: 8px;
+}
+
+#story-memory-settings hr {
+    border: none;
+    border-top: 1px solid #2c2c38;
+    margin: 10px 0;
+}
+
+.smem-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-bottom: 6px;
+}
+
+.smem-label {
+    margin: 10px 0 4px;
+    font-weight: 600;
+    color: #a8a8c0;
+    font-size: 12px;
+}
+
+#story-memory-settings textarea,
+#story-memory-settings input[type="number"],
+#story-memory-settings input[type="text"] {
+    background: #101016;
+    color: #d5d5e0;
+    border: 1px solid #33333f;
+    border-radius: 5px;
+    padding: 5px 7px;
+    font-size: 12px;
+}
+
+#story-memory-settings input[type="number"] {
+    width: 70px;
+}
+
+#story-memory-settings button {
+    background: #2a2a38;
+    color: #d5d5e0;
+    border: 1px solid #3a3a4a;
+    border-radius: 5px;
+    padding: 5px 12px;
+    cursor: pointer;
+    font-size: 12px;
+    transition: background 0.15s;
+}
+
+#story-memory-settings button:hover {
+    background: #36364a;
+}
+
+#story-memory-settings button.smem-danger {
+    color: #ff7b7b;
+    border-color: #6b3030;
+    background: #2a1c1c;
+}
+
+#story-memory-settings button.smem-danger:hover {
+    background: #3a2424;
+}
+
+.smem-char-block {
+    border: 1px solid #2c2c38;
+    border-radius: 6px;
+    padding: 6px 10px;
+    margin-bottom: 6px;
+    background: #14141a;
+}
+
+.smem-char-title {
+    cursor: pointer;
+    font-weight: 600;
+    user-select: none;
+    color: #d5d5e0;
+}
+
+.smem-char-title:hover {
+    color: #ffffff;
+}
+
+.smem-arrow {
+    display: inline-block;
+    width: 14px;
+    color: #8a8aa0;
+}
+
+.smem-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.smem-table th,
+.smem-table td {
+    border: 1px solid #2c2c38;
+    padding: 3px 4px;
+    text-align: center;
+}
+
+.smem-table th {
+    background: #1f1f28;
+    color: #b0b0c0;
+    font-weight: 600;
+}
+
+.smem-item {
+    font-size: 12px;
+    color: #9a9ab0;
+    margin-bottom: 3px;
+}
+
+.smem-item button {
+    padding: 1px 7px;
+    font-size: 11px;
+}
+
+.smem-muted {
+    font-size: 12px;
+    color: #777;
+}
+
+/* 手动总结区 */
+.smem-manual-box {
+    border: 1px dashed #3a3a4a;
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+    background: #15151c;
+}
